@@ -75,12 +75,27 @@ class DuckportClient:
         ("pre_market", pa.bool_()),
     ])
 
+    _KEEPALIVE_OPTIONS = [
+        ("grpc.keepalive_time_ms", 30_000),
+        ("grpc.keepalive_timeout_ms", 10_000),
+        ("grpc.keepalive_permit_without_calls", 1),
+        ("grpc.http2.max_pings_without_data", 0),
+    ]
+
     def __init__(self, addr: str = "localhost:50051", schema: str = "data", interval: str = "5m"):
         self.location = f"grpc://{addr}"
         self.schema = schema
         self.interval = interval
-        self.client = flight.FlightClient(self.location)
+        self.client = flight.FlightClient(self.location, generic_options=self._KEEPALIVE_OPTIONS)
         logger.info(f"DuckportClient connected: {self.location}, schema={schema}, interval={interval}")
+
+    def _reconnect(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self.client = flight.FlightClient(self.location, generic_options=self._KEEPALIVE_OPTIONS)
+        logger.warning(f"DuckportClient reconnected: {self.location}")
 
     # ── Low-level RPCs ──────────────────────────────────────────────
 
@@ -92,20 +107,32 @@ class DuckportClient:
     def execute(self, sql: str) -> dict:
         body = json.dumps({"sql": sql}).encode("utf-8")
         action = flight.Action("duckport.execute", body)
-        results = list(self.client.do_action(action))
+        try:
+            results = list(self.client.do_action(action))
+        except flight.FlightUnavailableError:
+            self._reconnect()
+            results = list(self.client.do_action(action))
         return json.loads(results[0].body.to_pybytes())
 
     def execute_transaction(self, statements: List[str]) -> dict:
         body = json.dumps({"statements": statements}).encode("utf-8")
         action = flight.Action("duckport.execute_transaction", body)
-        results = list(self.client.do_action(action))
+        try:
+            results = list(self.client.do_action(action))
+        except flight.FlightUnavailableError:
+            self._reconnect()
+            results = list(self.client.do_action(action))
         return json.loads(results[0].body.to_pybytes())
 
     def append(self, schema: str, table: str, data: pa.Table) -> dict:
         descriptor = flight.FlightDescriptor.for_path(
             "duckport.append", schema, table,
         )
-        writer, reader = self.client.do_put(descriptor, data.schema)
+        try:
+            writer, reader = self.client.do_put(descriptor, data.schema)
+        except flight.FlightUnavailableError:
+            self._reconnect()
+            writer, reader = self.client.do_put(descriptor, data.schema)
         writer.write_table(data)
         writer.done_writing()
         buf = reader.read()
@@ -115,7 +142,11 @@ class DuckportClient:
 
     def read_table(self, schema: str, table: str) -> pa.Table:
         ticket_json = json.dumps({"schema": schema, "table": table}).encode("utf-8")
-        reader = self.client.do_get(flight.Ticket(ticket_json))
+        try:
+            reader = self.client.do_get(flight.Ticket(ticket_json))
+        except flight.FlightUnavailableError:
+            self._reconnect()
+            reader = self.client.do_get(flight.Ticket(ticket_json))
         return reader.read_all()
 
     # ── Schema initialisation ───────────────────────────────────────
