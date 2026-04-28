@@ -14,6 +14,7 @@ Usage:
 import os
 import sys
 import signal
+import platform
 
 from binance_ingestor.utils.log_kit import logger, divider
 
@@ -21,9 +22,13 @@ os.environ['TZ'] = 'UTC'
 
 
 def main():
+    if platform.system() == 'Windows':
+        import asyncio
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     from binance_ingestor.config import (
         DUCKPORT_ADDR, DUCKPORT_SCHEMA,
-        KLINE_INTERVAL, DATA_SOURCES, ENABLE_WS,
+        KLINE_INTERVAL, DATA_SOURCES, ENABLE_WS, START_DATE,
     )
     from binance_ingestor.duckport_client import DuckportClient
     from binance_ingestor.data_jobs import (
@@ -32,7 +37,7 @@ def main():
 
     divider("Binance Ingestor starting")
 
-    client = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA)
+    client = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA, interval=KLINE_INTERVAL)
 
     def signal_handler(signum, frame):
         logger.critical("Received exit signal, shutting down...")
@@ -54,6 +59,7 @@ def main():
         markets=list(KLINE_MARKETS),
         interval=KLINE_INTERVAL,
         data_sources=DATA_SOURCES,
+        start_date=START_DATE,
     )
     client.verify_kline_interval(KLINE_INTERVAL)
 

@@ -7,8 +7,6 @@ without side effects during tests or library usage.
 """
 
 import os
-import platform
-import asyncio
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -49,10 +47,6 @@ FETCH_CONCURRENCY = min(CONCURRENCY, 10)
 DATA_SOURCES_STR = os.getenv('DATA_SOURCES', 'usdt_perp,usdt_spot')
 DATA_SOURCES = set(s.strip() for s in DATA_SOURCES_STR.split(','))
 
-# ── Platform ──────────────────────────────────────────────────────────
-if platform.system() == 'Windows':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-
 # ── Start date ────────────────────────────────────────────────────────
 GENESIS_TIME = pd.to_datetime('2009-01-03 00:00:00').tz_localize(tz=timezone.utc)
 START_DATE = os.getenv("START_DATE", None)
@@ -82,7 +76,8 @@ blind = False
 metrics_prefix = None
 SETTLED_SYMBOLS = None
 
-def create_download_semaphore() -> asyncio.Semaphore:
+def create_download_semaphore():
+    import asyncio
     return asyncio.Semaphore(value=min(CONCURRENCY, 8))
 
 need_analyse_set: set = set()

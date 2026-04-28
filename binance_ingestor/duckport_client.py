@@ -75,11 +75,12 @@ class DuckportClient:
         ("pre_market", pa.bool_()),
     ])
 
-    def __init__(self, addr: str = "localhost:50051", schema: str = "data"):
+    def __init__(self, addr: str = "localhost:50051", schema: str = "data", interval: str = "5m"):
         self.location = f"grpc://{addr}"
         self.schema = schema
+        self.interval = interval
         self.client = flight.FlightClient(self.location)
-        logger.info(f"DuckportClient connected: {self.location}, schema={schema}")
+        logger.info(f"DuckportClient connected: {self.location}, schema={schema}, interval={interval}")
 
     # ── Low-level RPCs ──────────────────────────────────────────────
 
@@ -124,40 +125,44 @@ class DuckportClient:
         markets: List[str],
         interval: str,
         data_sources: set,
+        start_date=None,
     ):
         s = self.schema
-        stmts: List[str] = [f"CREATE SCHEMA IF NOT EXISTS {s}"]
-
-        stmts.append(
+        stmts: List[str] = [
+            f"CREATE SCHEMA IF NOT EXISTS {s}",
             f"CREATE TABLE IF NOT EXISTS {s}.config_dict "
-            f"(key VARCHAR PRIMARY KEY, value VARCHAR)"
-        )
+            f"(key VARCHAR PRIMARY KEY, value VARCHAR)",
+            f"CREATE TABLE IF NOT EXISTS {s}.watermark ("
+            f"table_name  VARCHAR PRIMARY KEY, "
+            f"time_column VARCHAR NOT NULL, "
+            f"start_time  TIMESTAMP, "
+            f"duck_time   TIMESTAMP, "
+            f"updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            f")",
+        ]
 
+        start_ts = f"'{start_date} 00:00:00'" if start_date else "NULL"
         kline_cols = ", ".join(self.KLINE_COL_DEFS)
         for market in markets:
             if market not in data_sources:
                 continue
             target = f"{market}_{interval}"
-            stmts.append(
+            stmts += [
                 f"CREATE TABLE IF NOT EXISTS {s}.{target} "
-                f"({kline_cols}, PRIMARY KEY (open_time, symbol))"
-            )
-            stmts.append(
-                f"CREATE TABLE IF NOT EXISTS _staging_{target} ({kline_cols})"
-            )
+                f"({kline_cols}, PRIMARY KEY (open_time, symbol))",
+                f"CREATE TABLE IF NOT EXISTS _staging_{target} ({kline_cols})",
+                f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
+                f"VALUES ('{target}', 'open_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
+                f"ON CONFLICT (table_name) DO NOTHING",
+            ]
 
         exginfo_cols = ", ".join(self.EXGINFO_COL_DEFS)
-        stmts.append(
+        stmts += [
             f"CREATE TABLE IF NOT EXISTS {s}.exginfo "
             f"({exginfo_cols}, "
             f"created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-            f"PRIMARY KEY (market, symbol))"
-        )
-        stmts.append(
-            f"CREATE TABLE IF NOT EXISTS _staging_exginfo ({exginfo_cols})"
-        )
-
-        stmts.append(
+            f"PRIMARY KEY (market, symbol))",
+            f"CREATE TABLE IF NOT EXISTS _staging_exginfo ({exginfo_cols})",
             f"CREATE TABLE IF NOT EXISTS {s}.retention_tasks ("
             f"market VARCHAR NOT NULL, "
             f"interval VARCHAR NOT NULL, "
@@ -168,8 +173,8 @@ class DuckportClient:
             f"file_period INTEGER NOT NULL DEFAULT 1, "
             f"enabled BOOLEAN NOT NULL DEFAULT true, "
             f"updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
-            f"PRIMARY KEY (market, interval))"
-        )
+            f"PRIMARY KEY (market, interval))",
+        ]
 
         self.execute_transaction(stmts)
         logger.info(f"Schema '{s}' initialised on duckport-rs")
@@ -216,10 +221,13 @@ class DuckportClient:
         append_resp = self.append("main", staging, arrow_table)
 
         ts = pd.to_datetime(current_time).strftime("%Y-%m-%d %H:%M:%S")
+        target_table = f"{market}_{interval}"
         tx_resp = self.execute_transaction([
             f"INSERT INTO {target} SELECT * FROM {staging} ON CONFLICT DO NOTHING",
-            f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
-            f"VALUES ('{market}_duck_time', '{ts}')",
+            f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
+            f"VALUES ('{target_table}', 'open_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
+            f"ON CONFLICT (table_name) DO UPDATE SET "
+            f"duck_time = excluded.duck_time, updated_at = CURRENT_TIMESTAMP",
             f"TRUNCATE {staging}",
         ])
 
@@ -231,11 +239,14 @@ class DuckportClient:
         return tx_resp
 
     def replace_duck_time(self, market: str, duck_time_str: str) -> None:
-        """Set ``{market}_duck_time`` watermark in ``config_dict`` (after bulk load)."""
+        """Update duck_time watermark for the given market table."""
         s = self.schema
+        target = f"{market}_{self.interval}"
         self.execute_transaction([
-            f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
-            f"VALUES ('{market}_duck_time', '{duck_time_str}')",
+            f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
+            f"VALUES ('{target}', 'open_time', NULL, '{duck_time_str}', CURRENT_TIMESTAMP) "
+            f"ON CONFLICT (table_name) DO UPDATE SET "
+            f"duck_time = excluded.duck_time, updated_at = CURRENT_TIMESTAMP",
         ])
 
     def bulk_write_kline(
@@ -304,30 +315,34 @@ class DuckportClient:
     # ── Read helpers ────────────────────────────────────────────────
 
     def read_duck_time(self, market: str) -> Optional[pd.Timestamp]:
+        target = f"{market}_{self.interval}"
         try:
-            table = self.read_table(self.schema, "config_dict")
+            table = self.read_table(self.schema, "watermark")
             df = table.to_pandas()
-            row = df[df["key"] == f"{market}_duck_time"]
+            row = df[df["table_name"] == target]
             if row.empty:
                 return None
-            return pd.to_datetime(row["value"].iloc[0]).tz_localize(timezone.utc)
+            val = row["duck_time"].iloc[0]
+            if pd.isna(val):
+                return None
+            return pd.to_datetime(val).tz_localize(timezone.utc)
         except Exception as e:
-            logger.warning(f"read_duck_time({market}): {e}")
+            logger.warning(f"read_duck_time({target}): {e}")
             return None
 
     def read_duck_times(self, markets: List[str]) -> Dict[str, Optional[pd.Timestamp]]:
         result: Dict[str, Optional[pd.Timestamp]] = {}
         try:
-            table = self.read_table(self.schema, "config_dict")
+            table = self.read_table(self.schema, "watermark")
             df = table.to_pandas()
             for market in markets:
-                row = df[df["key"] == f"{market}_duck_time"]
+                target = f"{market}_{self.interval}"
+                row = df[df["table_name"] == target]
                 if row.empty:
                     result[market] = None
                 else:
-                    result[market] = pd.to_datetime(
-                        row["value"].iloc[0]
-                    ).tz_localize(timezone.utc)
+                    val = row["duck_time"].iloc[0]
+                    result[market] = None if pd.isna(val) else pd.to_datetime(val).tz_localize(timezone.utc)
         except Exception as e:
             logger.warning(f"read_duck_times: {e}")
             for market in markets:

@@ -30,7 +30,7 @@ from tqdm import tqdm
 from binance_ingestor.config import (
     KLINE_INTERVAL, PARQUET_DIR, DATA_SOURCES,
     DUCKPORT_ADDR, DUCKPORT_SCHEMA, RESOURCE_PATH,
-    proxy,
+    START_DATE, proxy,
 )
 from binance_ingestor.duckport_client import DuckportClient
 from binance_ingestor.hist import (
@@ -64,6 +64,7 @@ def init_remote_schema(client: DuckportClient):
         markets=list(KLINE_MARKETS),
         interval=KLINE_INTERVAL,
         data_sources=DATA_SOURCES,
+        start_date=START_DATE,
     )
     client.verify_kline_interval(KLINE_INTERVAL)
 
@@ -196,7 +197,7 @@ def clean_markets(markets: list) -> None:
 
             for col in ("first_candle", "last_candle"):
                 if meta_df[col].dt.tz is not None:
-                    meta_df[col] = meta_df[col].dt.tz_convert(None)
+                    meta_df[col] = meta_df[col].dt.tz_localize(None)
 
             valid_range = meta_df[meta_df["total_volume"] > 0][
                 ["symbol", "first_candle", "last_candle"]
@@ -211,12 +212,12 @@ def clean_markets(markets: list) -> None:
 
                 df = pd.read_parquet(fp)
                 if df["open_time"].dt.tz is not None:
-                    df["open_time"] = df["open_time"].dt.tz_convert(None)
+                    df["open_time"] = df["open_time"].dt.tz_localize(None)
 
                 df = df.merge(valid_range, on="symbol", how="left")
                 if df["first_candle"].dt.tz is not None:
-                    df["first_candle"] = df["first_candle"].dt.tz_convert(None)
-                    df["last_candle"]  = df["last_candle"].dt.tz_convert(None)
+                    df["first_candle"] = df["first_candle"].dt.tz_localize(None)
+                    df["last_candle"]  = df["last_candle"].dt.tz_localize(None)
                 df = df[df["open_time"].between(df["first_candle"], df["last_candle"])]
                 df = df[~df["symbol"].isin(useless)]
                 df = df.drop(columns=["first_candle", "last_candle"])
@@ -343,7 +344,7 @@ def main():
     logger.info("loadhist — 历史数据批量导入 (duckport-rs)")
     logger.info("=" * 60)
 
-    client = DuckportClient(DUCKPORT_ADDR, DUCKPORT_SCHEMA)
+    client = DuckportClient(DUCKPORT_ADDR, DUCKPORT_SCHEMA, interval=KLINE_INTERVAL)
     client.ping()
 
     logger.info("初始化远程 schema ...")
