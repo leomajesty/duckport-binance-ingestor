@@ -227,7 +227,7 @@ class DuckportClient:
             f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
             f"VALUES ('{target_table}', 'open_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
             f"ON CONFLICT (table_name) DO UPDATE SET "
-            f"duck_time = excluded.duck_time, updated_at = CURRENT_TIMESTAMP",
+            f"duck_time = excluded.duck_time, updated_at = excluded.updated_at",
             f"TRUNCATE {staging}",
         ])
 
@@ -246,7 +246,7 @@ class DuckportClient:
             f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
             f"VALUES ('{target}', 'open_time', NULL, '{duck_time_str}', CURRENT_TIMESTAMP) "
             f"ON CONFLICT (table_name) DO UPDATE SET "
-            f"duck_time = excluded.duck_time, updated_at = CURRENT_TIMESTAMP",
+            f"duck_time = excluded.duck_time, updated_at = excluded.updated_at",
         ])
 
     def bulk_write_kline(
