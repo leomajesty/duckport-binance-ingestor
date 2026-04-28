@@ -349,6 +349,28 @@ class DuckportClient:
                 result.setdefault(market, None)
         return result
 
+    def read_watermark_rows(self, markets: List[str]) -> Dict[str, Dict[str, Optional[pd.Timestamp]]]:
+        """Return {market: {'duck_time': ..., 'start_time': ...}} for each market."""
+        result: Dict[str, Dict[str, Optional[pd.Timestamp]]] = {}
+        try:
+            table = self.read_table(self.schema, "watermark")
+            df = table.to_pandas()
+            for market in markets:
+                target = f"{market}_{self.interval}"
+                row = df[df["table_name"] == target]
+                if row.empty:
+                    result[market] = {"duck_time": None, "start_time": None}
+                else:
+                    def _ts(col):
+                        val = row[col].iloc[0]
+                        return None if pd.isna(val) else pd.to_datetime(val).tz_localize(timezone.utc)
+                    result[market] = {"duck_time": _ts("duck_time"), "start_time": _ts("start_time")}
+        except Exception as e:
+            logger.warning(f"read_watermark_rows: {e}")
+            for market in markets:
+                result.setdefault(market, {"duck_time": None, "start_time": None})
+        return result
+
     def close(self):
         self.client.close()
         logger.info("DuckportClient closed")

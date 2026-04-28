@@ -15,6 +15,7 @@ import os
 import sys
 import signal
 import platform
+from datetime import datetime, timezone, timedelta
 
 from binance_ingestor.utils.log_kit import logger, divider
 
@@ -62,6 +63,26 @@ def main():
         start_date=START_DATE,
     )
     client.verify_kline_interval(KLINE_INTERVAL)
+
+    enabled_markets = [m for m in KLINE_MARKETS if m in DATA_SOURCES]
+    watermarks = client.read_watermark_rows(enabled_markets)
+    now = datetime.now(tz=timezone.utc)
+    stale = []
+    for market, wm in watermarks.items():
+        ref_time = wm["duck_time"] or wm["start_time"]
+        if ref_time is not None and now - ref_time > timedelta(days=7):
+            stale.append((market, ref_time, wm["duck_time"] is None))
+    if stale:
+        for market, ref_time, used_start in stale:
+            lag_days = (now - ref_time).days
+            field = "start_time" if used_start else "duck_time"
+            logger.error(
+                f"Market '{market}' is {lag_days} days behind "
+                f"({field}={ref_time:%Y-%m-%d %H:%M:%S UTC}). "
+                f"Please run 'loadhist' first to catch up historical data."
+            )
+        client.close()
+        sys.exit(1)
 
     if ENABLE_WS:
         WebsocketsDataJobs(client)
