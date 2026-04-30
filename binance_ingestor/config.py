@@ -7,6 +7,7 @@ without side effects during tests or library usage.
 """
 
 import os
+import pathlib
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -16,7 +17,12 @@ from dotenv import load_dotenv
 _env_file = os.getenv("INGESTOR_ENV_FILE", "config.env")
 load_dotenv(_env_file, override=False)
 
-# Also load server.env to inherit DUCKPORT_LISTEN_ADDR (no-op if absent)
+# Load server.env to inherit DUCKPORT_LISTEN_ADDR — check user path then system path
+_server_env = os.getenv(
+    "DUCKPORT_SERVER_ENV",
+    str(pathlib.Path.home() / ".duckport" / "server.env"),
+)
+load_dotenv(_server_env, override=False)
 load_dotenv("/opt/duckport/server.env", override=False)
 
 # ── duckport-rs server ────────────────────────────────────────────────

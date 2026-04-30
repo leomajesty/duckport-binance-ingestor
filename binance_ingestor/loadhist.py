@@ -340,8 +340,9 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main():
+    pqt_path = os.path.abspath(PARQUET_DIR)
     logger.info("=" * 60)
-    logger.info("loadhist — 历史数据批量导入 (duckport-rs)")
+    logger.info(f"loadhist — 历史数据批量导入「{pqt_path}」 (duckport-rs)")
     logger.info("=" * 60)
 
     client = DuckportClient(DUCKPORT_ADDR, DUCKPORT_SCHEMA, interval=KLINE_INTERVAL)
@@ -370,7 +371,6 @@ def main():
 
     client.close()
 
-    pqt_path = os.path.abspath(PARQUET_DIR)
     logger.info("\n" + "=" * 60)
     logger.info("loadhist 完成。")
     logger.info(f"Parquet 文件已保留在：{pqt_path}")
