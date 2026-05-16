@@ -14,6 +14,8 @@ of ON CONFLICT support:
 """
 
 import json
+import math
+import os
 from datetime import timezone
 from typing import Dict, List, Optional
 
@@ -25,6 +27,7 @@ from binance_ingestor.utils.log_kit import logger
 
 
 class DuckportClient:
+    DEFAULT_APPEND_MAX_MESSAGE_BYTES = 48 * 1024 * 1024
 
     KLINE_COL_DEFS = [
         "open_time TIMESTAMP",
@@ -86,8 +89,17 @@ class DuckportClient:
         self.location = f"grpc://{addr}"
         self.schema = schema
         self.interval = interval
+        self.append_max_message_bytes = int(
+            os.getenv(
+                "DUCKPORT_APPEND_MAX_MESSAGE_BYTES",
+                self.DEFAULT_APPEND_MAX_MESSAGE_BYTES,
+            )
+        )
         self.client = flight.FlightClient(self.location, generic_options=self._KEEPALIVE_OPTIONS)
-        logger.info(f"DuckportClient connected: {self.location}, schema={schema}, interval={interval}")
+        logger.info(
+            f"DuckportClient connected: {self.location}, schema={schema}, interval={interval}, "
+            f"append_max_message_bytes={self.append_max_message_bytes}"
+        )
 
     def _reconnect(self):
         try:
@@ -98,6 +110,16 @@ class DuckportClient:
         logger.warning(f"DuckportClient reconnected: {self.location}")
 
     # ── Low-level RPCs ──────────────────────────────────────────────
+
+    def _append_max_rows_per_message(self, data: pa.Table, max_rows: Optional[int] = None) -> int:
+        if len(data) == 0:
+            return 1
+
+        bytes_per_row = max(1, math.ceil(data.nbytes / len(data)))
+        rows = max(1, self.append_max_message_bytes // bytes_per_row)
+        if max_rows is not None:
+            rows = min(rows, max_rows)
+        return rows
 
     def ping(self) -> dict:
         action = flight.Action("duckport.ping", b"")
@@ -133,7 +155,8 @@ class DuckportClient:
         except flight.FlightUnavailableError:
             self._reconnect()
             writer, reader = self.client.do_put(descriptor, data.schema)
-        writer.write_table(data)
+        max_chunksize = self._append_max_rows_per_message(data)
+        writer.write_table(data, max_chunksize=max_chunksize)
         writer.done_writing()
         buf = reader.read()
         resp = json.loads(bytes(buf))
@@ -299,9 +322,10 @@ class DuckportClient:
         target = f"{s}.{market}_{interval}"
         staging = f"_staging_{market}_{interval}"
         total = len(arrow_table)
+        row_chunk_size = self._append_max_rows_per_message(arrow_table, chunk_size)
 
-        for offset in range(0, total, chunk_size):
-            length = min(chunk_size, total - offset)
+        for offset in range(0, total, row_chunk_size):
+            length = min(row_chunk_size, total - offset)
             chunk = arrow_table.slice(offset, length)
             self.execute(f"TRUNCATE {staging}")
             self.append("main", staging, chunk)
@@ -310,7 +334,8 @@ class DuckportClient:
                 f"TRUNCATE {staging}",
             ])
             logger.info(
-                f"bulk_write_kline: {market} chunk {offset}–{offset + length} / {total}"
+                f"bulk_write_kline: {market} chunk {offset}-{offset + length} / {total} "
+                f"(rows_per_chunk={row_chunk_size}, bytes={chunk.nbytes})"
             )
 
         if sync_duck_time:
