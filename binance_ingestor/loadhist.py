@@ -25,6 +25,7 @@ from glob import glob
 import aiohttp
 import duckdb
 import pandas as pd
+import pyarrow as pa
 from tqdm import tqdm
 
 from binance_ingestor.config import (
@@ -50,6 +51,9 @@ KLINE_MARKETS = ('usdt_perp', 'usdt_spot')
 # Re-load duck_time - BOUNDARY_DAYS as the starting boundary.
 # The 1-day overlap is handled by ON CONFLICT DO NOTHING (idempotent).
 BOUNDARY_DAYS = int(os.getenv("LOADHIST_BOUNDARY_DAYS", "1"))
+LOADHIST_BATCH_ROWS = int(os.getenv("LOADHIST_BATCH_ROWS", "50000"))
+LOADHIST_DUCKDB_MEMORY_LIMIT = os.getenv("LOADHIST_DUCKDB_MEMORY_LIMIT", "")
+LOADHIST_DUCKDB_THREADS = int(os.getenv("LOADHIST_DUCKDB_THREADS", "1"))
 
 
 def get_enabled_kline_markets():
@@ -270,6 +274,9 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
         )
 
         local_conn = duckdb.connect()
+        local_conn.execute(f"SET threads TO {LOADHIST_DUCKDB_THREADS}")
+        if LOADHIST_DUCKDB_MEMORY_LIMIT:
+            local_conn.execute(f"SET memory_limit = '{LOADHIST_DUCKDB_MEMORY_LIMIT}'")
         new_max    = None
         total_rows = 0
 
@@ -297,7 +304,7 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
                     if boundary else ""
                 )
 
-                arrow = local_conn.execute(f"""
+                reader = local_conn.execute(f"""
                     SELECT open_time, symbol, open, high, low, close, volume,
                            quote_volume, trade_num,
                            taker_buy_base_asset_volume,
@@ -305,22 +312,30 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
                            avg_price
                     FROM read_parquet('{fp_esc}')
                     {where}
-                    ORDER BY open_time
-                """).fetch_arrow_table()
+                """).to_arrow_reader(batch_size=LOADHIST_BATCH_ROWS)
 
-                if len(arrow) == 0:
+                file_rows = 0
+                for batch in reader:
+                    if batch.num_rows == 0:
+                        continue
+
+                    arrow = pa.Table.from_batches([batch])
+                    client.bulk_write_kline(
+                        arrow, market, KLINE_INTERVAL, "",
+                        chunk_size=LOADHIST_BATCH_ROWS,
+                        sync_duck_time=False,
+                    )
+                    file_rows += len(arrow)
+                    total_rows += len(arrow)
+
+                if file_rows == 0:
                     continue
 
-                client.bulk_write_kline(
-                    arrow, market, KLINE_INTERVAL, "",
-                    sync_duck_time=False,
-                )
-                total_rows += len(arrow)
                 if new_max is None or fm > new_max:
                     new_max = fm
 
                 logger.info(
-                    f"{market}  {os.path.basename(fp)}: +{len(arrow):,} rows"
+                    f"{market}  {os.path.basename(fp)}: +{file_rows:,} rows"
                     f"  (file_max={fm:%Y-%m-%d})"
                 )
 

@@ -123,15 +123,34 @@ class MarketListener:
             self.symbols = set(await self.get_exginfo())
 
         self.listeners = self.create_listeners(market=self.market, symbols=self.symbols, que=self.main_queue)
-        listen_tasks = [v.start_listen() for k, v in self.listeners.items()]
-        dispatcher_task = self.dispatcher()
-        scheduled_task = self.scheduled_run()
+        listen_tasks = [
+            asyncio.create_task(v.start_listen(), name=f"{self.market}-listener-{k}")
+            for k, v in self.listeners.items()
+        ]
+        dispatcher_task = asyncio.create_task(self.dispatcher(), name=f"{self.market}-dispatcher")
+        scheduled_task = asyncio.create_task(self.scheduled_run(), name=f"{self.market}-scheduler")
 
         logger.ok(f'{self.market} Market Listener initialized...')
 
         tasks = listen_tasks + [dispatcher_task, scheduled_task]
 
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await self._cancel_tasks(tasks)
+
+    @staticmethod
+    async def _cancel_tasks(tasks):
+        pending = [task for task in tasks if not task.done()]
+        if not pending:
+            return
+
+        for task in pending:
+            task.cancel()
+
+        results = await asyncio.gather(*pending, return_exceptions=True)
+        cancelled = sum(isinstance(result, asyncio.CancelledError) for result in results)
+        logger.warning(f"MarketListener cleanup: cancelled {cancelled}/{len(pending)} pending tasks")
 
     def _collect_kline_data(self, run_time: datetime, symbol: str, kline_data: Dict[str, Any]) -> None:
         try:

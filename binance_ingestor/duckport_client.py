@@ -89,6 +89,18 @@ class DuckportClient:
         self.location = f"grpc://{addr}"
         self.schema = schema
         self.interval = interval
+        self.ingestor = (
+            os.getenv("INGESTOR_NAME")
+            or os.getenv("INGESTOR_INSTANCE")
+            or os.getenv("INGESTOR_EXEC")
+            or "binance-ingestor"
+        )
+        self.max_lag_seconds = int(
+            os.getenv(
+                "WATERMARK_MAX_LAG_SECONDS",
+                str(self._default_max_lag_seconds(interval)),
+            )
+        )
         self.append_max_message_bytes = int(
             os.getenv(
                 "DUCKPORT_APPEND_MAX_MESSAGE_BYTES",
@@ -100,6 +112,16 @@ class DuckportClient:
             f"DuckportClient connected: {self.location}, schema={schema}, interval={interval}, "
             f"append_max_message_bytes={self.append_max_message_bytes}"
         )
+
+    @staticmethod
+    def _sql_str(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    @staticmethod
+    def _default_max_lag_seconds(interval: str) -> int:
+        if interval.endswith("m") and interval[:-1].isdigit():
+            return max(900, int(interval[:-1]) * 60 * 2)
+        return 900
 
     def _reconnect(self):
         try:
@@ -182,21 +204,16 @@ class DuckportClient:
         start_date=None,
     ):
         s = self.schema
+        # duckport-rs owns system metadata tables such as data.watermark.
         stmts: List[str] = [
             f"CREATE SCHEMA IF NOT EXISTS {s}",
             f"CREATE TABLE IF NOT EXISTS {s}.config_dict "
             f"(key VARCHAR PRIMARY KEY, value VARCHAR)",
-            f"CREATE TABLE IF NOT EXISTS {s}.watermark ("
-            f"table_name  VARCHAR PRIMARY KEY, "
-            f"time_column VARCHAR NOT NULL, "
-            f"start_time  TIMESTAMP, "
-            f"duck_time   TIMESTAMP, "
-            f"updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-            f")",
         ]
 
         start_ts = f"'{start_date} 00:00:00'" if start_date else "NULL"
         kline_cols = ", ".join(self.KLINE_COL_DEFS)
+        ingestor_sql = self._sql_str(self.ingestor)
         for market in markets:
             if market not in data_sources:
                 continue
@@ -205,9 +222,11 @@ class DuckportClient:
                 f"CREATE TABLE IF NOT EXISTS {s}.{target} "
                 f"({kline_cols}, PRIMARY KEY (open_time, symbol))",
                 f"CREATE TABLE IF NOT EXISTS _staging_{target} ({kline_cols})",
-                f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
-                f"VALUES ('{target}', 'open_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
-                f"ON CONFLICT (table_name) DO NOTHING",
+                f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+                f"VALUES ('{target}', {ingestor_sql}, {self.max_lag_seconds}, 'open_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
+                f"ON CONFLICT (table_name) DO UPDATE SET "
+                f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
+                f"time_column = excluded.time_column",
             ]
 
         exginfo_cols = ", ".join(self.EXGINFO_COL_DEFS)
@@ -278,9 +297,10 @@ class DuckportClient:
         target_table = f"{market}_{interval}"
         tx_resp = self.execute_transaction([
             f"INSERT INTO {target} SELECT * FROM {staging} ON CONFLICT DO NOTHING",
-            f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
-            f"VALUES ('{target_table}', 'open_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
+            f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+            f"VALUES ('{target_table}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'open_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
             f"ON CONFLICT (table_name) DO UPDATE SET "
+            f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
             f"duck_time = excluded.duck_time, updated_at = excluded.updated_at",
             f"TRUNCATE {staging}",
         ])
@@ -297,9 +317,10 @@ class DuckportClient:
         s = self.schema
         target = f"{market}_{self.interval}"
         self.execute_transaction([
-            f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
-            f"VALUES ('{target}', 'open_time', NULL, '{duck_time_str}', CURRENT_TIMESTAMP) "
+            f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+            f"VALUES ('{target}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'open_time', NULL, '{duck_time_str}', CURRENT_TIMESTAMP) "
             f"ON CONFLICT (table_name) DO UPDATE SET "
+            f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
             f"duck_time = excluded.duck_time, updated_at = excluded.updated_at",
         ])
 
