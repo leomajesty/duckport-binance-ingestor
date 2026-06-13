@@ -47,7 +47,7 @@ class DuckportClient:
     EXGINFO_COL_NAMES = [
         "market", "symbol", "status", "base_asset", "quote_asset",
         "price_tick", "lot_size", "min_notional_value",
-        "contract_type", "margin_asset", "pre_market",
+        "contract_type", "margin_asset", "pre_market", "underlying_type",
     ]
 
     EXGINFO_COL_DEFS = [
@@ -62,6 +62,7 @@ class DuckportClient:
         "contract_type VARCHAR",
         "margin_asset VARCHAR",
         "pre_market BOOLEAN",
+        "underlying_type VARCHAR",
     ]
 
     EXGINFO_ARROW_SCHEMA = pa.schema([
@@ -76,6 +77,7 @@ class DuckportClient:
         ("contract_type", pa.string()),
         ("margin_asset", pa.string()),
         ("pre_market", pa.bool_()),
+        ("underlying_type", pa.string()),
     ])
 
     _KEEPALIVE_OPTIONS = [
@@ -235,7 +237,9 @@ class DuckportClient:
             f"({exginfo_cols}, "
             f"created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
             f"PRIMARY KEY (market, symbol))",
-            f"CREATE TABLE IF NOT EXISTS _staging_exginfo ({exginfo_cols})",
+            f"ALTER TABLE {s}.exginfo ADD COLUMN IF NOT EXISTS underlying_type VARCHAR",
+            "DROP TABLE IF EXISTS _staging_exginfo",
+            f"CREATE TABLE _staging_exginfo ({exginfo_cols})",
             f"CREATE TABLE IF NOT EXISTS {s}.retention_tasks ("
             f"market VARCHAR NOT NULL, "
             f"interval VARCHAR NOT NULL, "

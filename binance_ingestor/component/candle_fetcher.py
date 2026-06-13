@@ -34,6 +34,7 @@ def _parse_usdt_futures_syminfo(info):
         'market': 'usdt_perp',
         'symbol': info['symbol'],
         'contract_type': info['contractType'],
+        'underlying_type': info.get('underlyingType'),
         'status': info['status'],
         'base_asset': info['baseAsset'],
         'quote_asset': info['quoteAsset'],
@@ -50,6 +51,7 @@ def _parse_coin_futures_syminfo(info):
         'market': 'coin_perp',
         'symbol': info['symbol'],
         'contract_type': info['contractType'],
+        'underlying_type': info.get('underlyingType'),
         'status': info['contractStatus'],
         'base_asset': info['baseAsset'],
         'quote_asset': info['quoteAsset'],
@@ -78,6 +80,7 @@ def _parse_spot_syminfo(info):
         'min_notional_value': Decimal(min_notional),
         'pre_market': _check_from_permission_sets(permission_sets, 'PRE_MARKET'),
         'contract_type': None,
+        'underlying_type': None,
         'margin_asset': None,
     }
 
