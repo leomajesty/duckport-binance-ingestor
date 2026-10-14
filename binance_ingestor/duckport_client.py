@@ -26,6 +26,40 @@ import pyarrow.flight as flight
 from binance_ingestor.utils.log_kit import logger
 
 
+def _normalize_flight_location(addr: str) -> str:
+    if addr.startswith("grpc://") or addr.startswith("grpc+tls://"):
+        return addr
+    return f"grpc://{addr}"
+
+
+def _resolve_token(token: Optional[str]) -> str:
+    if token is not None:
+        return token
+    return os.getenv("DUCKPORT_TOKEN", "")
+
+
+class _BearerMiddleware(flight.ClientMiddleware):
+    def __init__(self, token: str) -> None:
+        self._value = f"Bearer {token}".encode()
+
+    def sending_headers(self):
+        return {b"authorization": self._value}
+
+
+class _BearerFactory(flight.ClientMiddlewareFactory):
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def start_call(self, info):
+        return _BearerMiddleware(self._token)
+
+
+def _open_flight_client(location: str, token: str, **kwargs):
+    if token:
+        kwargs["middleware"] = [_BearerFactory(token)]
+    return flight.FlightClient(location, **kwargs)
+
+
 class DuckportClient:
     DEFAULT_APPEND_MAX_MESSAGE_BYTES = 48 * 1024 * 1024
 
@@ -87,8 +121,15 @@ class DuckportClient:
         ("grpc.http2.max_pings_without_data", 0),
     ]
 
-    def __init__(self, addr: str = "localhost:50051", schema: str = "data", interval: str = "5m"):
-        self.location = f"grpc://{addr}"
+    def __init__(
+        self,
+        addr: str = "localhost:50051",
+        schema: str = "data",
+        interval: str = "5m",
+        token: Optional[str] = None,
+    ):
+        self.location = _normalize_flight_location(addr)
+        self._token = _resolve_token(token)
         self.schema = schema
         self.interval = interval
         self.ingestor = (
@@ -109,7 +150,7 @@ class DuckportClient:
                 self.DEFAULT_APPEND_MAX_MESSAGE_BYTES,
             )
         )
-        self.client = flight.FlightClient(self.location, generic_options=self._KEEPALIVE_OPTIONS)
+        self.client = self._connect()
         logger.info(
             f"DuckportClient connected: {self.location}, schema={schema}, interval={interval}, "
             f"append_max_message_bytes={self.append_max_message_bytes}"
@@ -130,8 +171,15 @@ class DuckportClient:
             self.client.close()
         except Exception:
             pass
-        self.client = flight.FlightClient(self.location, generic_options=self._KEEPALIVE_OPTIONS)
+        self.client = self._connect()
         logger.warning(f"DuckportClient reconnected: {self.location}")
+
+    def _connect(self):
+        return _open_flight_client(
+            self.location,
+            self._token,
+            generic_options=self._KEEPALIVE_OPTIONS,
+        )
 
     # ── Low-level RPCs ──────────────────────────────────────────────
 
