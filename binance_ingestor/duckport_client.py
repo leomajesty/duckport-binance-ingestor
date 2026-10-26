@@ -6,11 +6,15 @@ Wraps Arrow Flight RPCs into a typed API:
   DoPut    : duckport.append  (bulk Arrow ingestion)
   DoGet    : Airport-protocol table scans
 
-Write methods use a *staging-table* pattern to work around DuckDB Appender's lack
-of ON CONFLICT support:
+Write methods use a *staging-table* pattern:
   1. DoPut -> staging table (no PK)
-  2. execute_transaction -> INSERT INTO target ON CONFLICT DO NOTHING + watermark
+  2. execute_transaction -> INSERT INTO target with an anti-join dedup + watermark
   3. Truncate staging
+
+Business tables carry no PRIMARY KEY: DuckDB 1.5 never reclaims deleted rows of indexed
+tables (so retention could not free space) and a composite key is never used by queries.
+The anti-join in ``_merge_sql`` keeps writes idempotent instead, and also works on tables
+created by older versions that still have the key.
 """
 
 import json
@@ -21,6 +25,7 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.flight as flight
 
 from binance_ingestor.utils.log_kit import logger
@@ -161,6 +166,44 @@ class DuckportClient:
         return "'" + value.replace("'", "''") + "'"
 
     @staticmethod
+    def _merge_sql(target: str, staging: str, data: pa.Table) -> Optional[str]:
+        """INSERT the staged rows whose (open_time, symbol) is not in ``target`` yet.
+
+        ``data`` must already be what was appended to ``staging`` (see ``_prepare``), so
+        its bounds are naive UTC like the stored column. ``DISTINCT ON`` drops duplicates
+        inside the batch; the constant time bounds let zonemaps limit the existing-key scan
+        to the batch's own time range. Rows without an open_time are not written (the old
+        PRIMARY KEY rejected them too). Returns None when there is nothing to insert.
+        """
+        lo = pc.min(data["open_time"]).as_py() if len(data) else None
+        hi = pc.max(data["open_time"]).as_py() if len(data) else None
+        if lo is None or hi is None:
+            return None
+        return (
+            f"INSERT INTO {target} "
+            f"SELECT s.* FROM (SELECT DISTINCT ON (open_time, symbol) * FROM {staging} "
+            f"WHERE open_time IS NOT NULL) s "
+            f"ANTI JOIN (SELECT open_time, symbol FROM {target} "
+            f"WHERE open_time BETWEEN TIMESTAMP '{lo:%Y-%m-%d %H:%M:%S.%f}' "
+            f"AND TIMESTAMP '{hi:%Y-%m-%d %H:%M:%S.%f}') t "
+            f"ON s.open_time = t.open_time AND s.symbol = t.symbol"
+        )
+
+    @staticmethod
+    def _prepare(data: pa.Table) -> pa.Table:
+        """Naive-UTC open_time, sorted by time.
+
+        A tz-aware column is converted to naive UTC here, so the server never has to guess
+        a time zone and the anti-join bounds match the stored values. Sorted rows keep each
+        row group's time range tight (better zonemaps).
+        """
+        col = data["open_time"]
+        if pa.types.is_timestamp(col.type) and col.type.tz is not None:
+            idx = data.schema.get_field_index("open_time")
+            data = data.set_column(idx, "open_time", pc.cast(col, pa.timestamp(col.type.unit)))
+        return data.sort_by([("open_time", "ascending"), ("symbol", "ascending")])
+
+    @staticmethod
     def _default_max_lag_seconds(interval: str) -> int:
         if interval.endswith("m") and interval[:-1].isdigit():
             return max(900, int(interval[:-1]) * 60 * 2)
@@ -269,9 +312,11 @@ class DuckportClient:
                 continue
             target = f"{market}_{interval}"
             stmts += [
-                f"CREATE TABLE IF NOT EXISTS {s}.{target} "
-                f"({kline_cols}, PRIMARY KEY (open_time, symbol))",
+                f"CREATE TABLE IF NOT EXISTS {s}.{target} ({kline_cols})",
                 f"CREATE TABLE IF NOT EXISTS _staging_{target} ({kline_cols})",
+                # Tells `duckport migrate nopk` this table's writer no longer needs a key.
+                f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
+                f"VALUES ('write_mode:{target}', 'anti_join')",
                 f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
                 f"VALUES ('{target}', {ingestor_sql}, {self.max_lag_seconds}, 'open_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
                 f"ON CONFLICT (table_name) DO UPDATE SET "
@@ -281,24 +326,16 @@ class DuckportClient:
 
         exginfo_cols = ", ".join(self.EXGINFO_COL_DEFS)
         stmts += [
+            # Snapshot table refreshed by DELETE + INSERT; without a key the deleted rows
+            # are reclaimed at checkpoint instead of piling up.
             f"CREATE TABLE IF NOT EXISTS {s}.exginfo "
             f"({exginfo_cols}, "
-            f"created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-            f"PRIMARY KEY (market, symbol))",
+            f"created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
             f"ALTER TABLE {s}.exginfo ADD COLUMN IF NOT EXISTS underlying_type VARCHAR",
             "DROP TABLE IF EXISTS _staging_exginfo",
             f"CREATE TABLE _staging_exginfo ({exginfo_cols})",
-            f"CREATE TABLE IF NOT EXISTS {s}.retention_tasks ("
-            f"market VARCHAR NOT NULL, "
-            f"interval VARCHAR NOT NULL, "
-            f"schema_name VARCHAR NOT NULL, "
-            f"retention_days INTEGER NOT NULL DEFAULT 7, "
-            f"parquet_dir VARCHAR NOT NULL, "
-            f"start_date VARCHAR NOT NULL DEFAULT '2009-01-03', "
-            f"file_period INTEGER NOT NULL DEFAULT 1, "
-            f"enabled BOOLEAN NOT NULL DEFAULT true, "
-            f"updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
-            f"PRIMARY KEY (market, interval))",
+            f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
+            f"VALUES ('write_mode:exginfo', 'anti_join')",
         ]
 
         self.execute_transaction(stmts)
@@ -340,15 +377,15 @@ class DuckportClient:
         if hasattr(df["open_time"].dt, "tz") and df["open_time"].dt.tz is not None:
             df["open_time"] = df["open_time"].dt.tz_localize(None)
 
-        arrow_table = pa.Table.from_pandas(df, preserve_index=False)
+        arrow_table = self._prepare(pa.Table.from_pandas(df, preserve_index=False))
 
         self.execute(f"TRUNCATE {staging}")
         append_resp = self.append("main", staging, arrow_table)
 
         ts = pd.to_datetime(current_time).strftime("%Y-%m-%d %H:%M:%S")
         target_table = f"{market}_{interval}"
-        tx_resp = self.execute_transaction([
-            f"INSERT INTO {target} SELECT * FROM {staging} ON CONFLICT DO NOTHING",
+        merge = self._merge_sql(target, staging, arrow_table)
+        tx_resp = self.execute_transaction(([merge] if merge else []) + [
             f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
             f"VALUES ('{target_table}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'open_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
             f"ON CONFLICT (table_name) DO UPDATE SET "
@@ -394,18 +431,19 @@ class DuckportClient:
         s = self.schema
         target = f"{s}.{market}_{interval}"
         staging = f"_staging_{market}_{interval}"
+        arrow_table = self._prepare(arrow_table)
         total = len(arrow_table)
         row_chunk_size = self._append_max_rows_per_message(arrow_table, chunk_size)
 
         for offset in range(0, total, row_chunk_size):
             length = min(row_chunk_size, total - offset)
             chunk = arrow_table.slice(offset, length)
+            merge = self._merge_sql(target, staging, chunk)
+            if merge is None:
+                continue
             self.execute(f"TRUNCATE {staging}")
             self.append("main", staging, chunk)
-            self.execute_transaction([
-                f"INSERT INTO {target} SELECT * FROM {staging} ON CONFLICT DO NOTHING",
-                f"TRUNCATE {staging}",
-            ])
+            self.execute_transaction([merge, f"TRUNCATE {staging}"])
             logger.info(
                 f"bulk_write_kline: {market} chunk {offset}-{offset + length} / {total} "
                 f"(rows_per_chunk={row_chunk_size}, bytes={chunk.nbytes})"
@@ -436,7 +474,7 @@ class DuckportClient:
         self.execute_transaction([
             f"DELETE FROM {s}.exginfo WHERE market = '{market}'",
             f"INSERT INTO {s}.exginfo ({col_list}) "
-            f"SELECT {col_list} FROM _staging_exginfo",
+            f"SELECT DISTINCT ON (market, symbol) {col_list} FROM _staging_exginfo",
             "TRUNCATE _staging_exginfo",
         ])
         logger.info(f"save_exginfo: {market}, {len(df)} records")
