@@ -169,16 +169,20 @@ class DuckportClient:
     def _merge_sql(target: str, staging: str, data: pa.Table) -> Optional[str]:
         """INSERT the staged rows whose (open_time, symbol) is not in ``target`` yet.
 
-        ``DISTINCT ON`` drops duplicates inside the batch; the constant time bounds let
-        zonemaps limit the existing-key scan to the batch's own time range.
+        ``data`` must already be what was appended to ``staging`` (see ``_prepare``), so
+        its bounds are naive UTC like the stored column. ``DISTINCT ON`` drops duplicates
+        inside the batch; the constant time bounds let zonemaps limit the existing-key scan
+        to the batch's own time range. Rows without an open_time are not written (the old
+        PRIMARY KEY rejected them too). Returns None when there is nothing to insert.
         """
-        if len(data) == 0:
+        lo = pc.min(data["open_time"]).as_py() if len(data) else None
+        hi = pc.max(data["open_time"]).as_py() if len(data) else None
+        if lo is None or hi is None:
             return None
-        lo = pc.min(data["open_time"]).as_py()
-        hi = pc.max(data["open_time"]).as_py()
         return (
             f"INSERT INTO {target} "
-            f"SELECT s.* FROM (SELECT DISTINCT ON (open_time, symbol) * FROM {staging}) s "
+            f"SELECT s.* FROM (SELECT DISTINCT ON (open_time, symbol) * FROM {staging} "
+            f"WHERE open_time IS NOT NULL) s "
             f"ANTI JOIN (SELECT open_time, symbol FROM {target} "
             f"WHERE open_time BETWEEN TIMESTAMP '{lo:%Y-%m-%d %H:%M:%S.%f}' "
             f"AND TIMESTAMP '{hi:%Y-%m-%d %H:%M:%S.%f}') t "
@@ -186,8 +190,17 @@ class DuckportClient:
         )
 
     @staticmethod
-    def _sorted_by_time(data: pa.Table) -> pa.Table:
-        """Rows sorted by time keep each row group's time range tight (better zonemaps)."""
+    def _prepare(data: pa.Table) -> pa.Table:
+        """Naive-UTC open_time, sorted by time.
+
+        A tz-aware column is converted to naive UTC here, so the server never has to guess
+        a time zone and the anti-join bounds match the stored values. Sorted rows keep each
+        row group's time range tight (better zonemaps).
+        """
+        col = data["open_time"]
+        if pa.types.is_timestamp(col.type) and col.type.tz is not None:
+            idx = data.schema.get_field_index("open_time")
+            data = data.set_column(idx, "open_time", pc.cast(col, pa.timestamp(col.type.unit)))
         return data.sort_by([("open_time", "ascending"), ("symbol", "ascending")])
 
     @staticmethod
@@ -364,7 +377,7 @@ class DuckportClient:
         if hasattr(df["open_time"].dt, "tz") and df["open_time"].dt.tz is not None:
             df["open_time"] = df["open_time"].dt.tz_localize(None)
 
-        arrow_table = self._sorted_by_time(pa.Table.from_pandas(df, preserve_index=False))
+        arrow_table = self._prepare(pa.Table.from_pandas(df, preserve_index=False))
 
         self.execute(f"TRUNCATE {staging}")
         append_resp = self.append("main", staging, arrow_table)
@@ -418,19 +431,19 @@ class DuckportClient:
         s = self.schema
         target = f"{s}.{market}_{interval}"
         staging = f"_staging_{market}_{interval}"
-        arrow_table = self._sorted_by_time(arrow_table)
+        arrow_table = self._prepare(arrow_table)
         total = len(arrow_table)
         row_chunk_size = self._append_max_rows_per_message(arrow_table, chunk_size)
 
         for offset in range(0, total, row_chunk_size):
             length = min(row_chunk_size, total - offset)
             chunk = arrow_table.slice(offset, length)
+            merge = self._merge_sql(target, staging, chunk)
+            if merge is None:
+                continue
             self.execute(f"TRUNCATE {staging}")
             self.append("main", staging, chunk)
-            self.execute_transaction([
-                self._merge_sql(target, staging, chunk),
-                f"TRUNCATE {staging}",
-            ])
+            self.execute_transaction([merge, f"TRUNCATE {staging}"])
             logger.info(
                 f"bulk_write_kline: {market} chunk {offset}-{offset + length} / {total} "
                 f"(rows_per_chunk={row_chunk_size}, bytes={chunk.nbytes})"
