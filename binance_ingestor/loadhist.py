@@ -5,7 +5,7 @@ Flow:
   Step 0  ping + init_schema
   Step 1  Download monthly/daily zips → convert to Parquet
   Step 2  Incremental clean (skip unchanged files via .ok marker, atomic write)
-  Step 3  Incremental load (boundary = duck_time - BOUNDARY_DAYS, ON CONFLICT DO NOTHING)
+  Step 3  Incremental load (boundary = duck_time - BOUNDARY_DAYS, anti-join dedup)
 
 Assumptions:
   - Data before duck_time is complete and accurate; no backfill needed.
@@ -49,7 +49,7 @@ from binance_ingestor.utils.timer import timer
 KLINE_MARKETS = ('usdt_perp', 'usdt_spot')
 
 # Re-load duck_time - BOUNDARY_DAYS as the starting boundary.
-# The 1-day overlap is handled by ON CONFLICT DO NOTHING (idempotent).
+# The 1-day overlap is deduplicated by the anti-join in bulk_write_kline (idempotent).
 BOUNDARY_DAYS = int(os.getenv("LOADHIST_BOUNDARY_DAYS", "1"))
 LOADHIST_BATCH_ROWS = int(os.getenv("LOADHIST_BATCH_ROWS", "50000"))
 LOADHIST_DUCKDB_MEMORY_LIMIT = os.getenv("LOADHIST_DUCKDB_MEMORY_LIMIT", "")
@@ -255,7 +255,7 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
 
       file_max <  boundary  →  skip (all rows already in hot DB)
       file_max >= boundary  →  WHERE open_time >= boundary
-                                ON CONFLICT DO NOTHING handles the overlap
+                                the anti-join dedup handles the overlap
       boundary is None      →  full load (first run)
     """
     for market in markets:
@@ -312,6 +312,7 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
                            avg_price
                     FROM read_parquet('{fp_esc}')
                     {where}
+                    ORDER BY open_time, symbol
                 """).to_arrow_reader(batch_size=LOADHIST_BATCH_ROWS)
 
                 file_rows = 0
