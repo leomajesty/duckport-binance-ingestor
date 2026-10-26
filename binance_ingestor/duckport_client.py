@@ -314,7 +314,7 @@ class DuckportClient:
             stmts += [
                 f"CREATE TABLE IF NOT EXISTS {s}.{target} ({kline_cols})",
                 f"CREATE TABLE IF NOT EXISTS _staging_{target} ({kline_cols})",
-                # Tells `duckport migrate nopk` this table's writer no longer needs a key.
+                # Tells `duckport upgrade` this table's writer no longer needs a key.
                 f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
                 f"VALUES ('write_mode:{target}', 'anti_join')",
                 f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
