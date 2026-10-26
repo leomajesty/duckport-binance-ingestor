@@ -21,6 +21,7 @@ import json
 import math
 import os
 from datetime import timezone
+from importlib import metadata
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -67,6 +68,8 @@ def _open_flight_client(location: str, token: str, **kwargs):
 
 class DuckportClient:
     DEFAULT_APPEND_MAX_MESSAGE_BYTES = 48 * 1024 * 1024
+    # Console-script name; duckport matches it against the installed plugin instances.
+    WRITER = "binance-ingestor"
 
     KLINE_COL_DEFS = [
         "open_time TIMESTAMP",
@@ -204,6 +207,13 @@ class DuckportClient:
         return data.sort_by([("open_time", "ascending"), ("symbol", "ascending")])
 
     @staticmethod
+    def _interval_seconds(interval: str) -> Optional[int]:
+        units = {"m": 60, "h": 3600, "d": 86400}
+        if interval[-1:] in units and interval[:-1].isdigit():
+            return int(interval[:-1]) * units[interval[-1]]
+        return None
+
+    @staticmethod
     def _default_max_lag_seconds(interval: str) -> int:
         if interval.endswith("m") and interval[:-1].isdigit():
             return max(900, int(interval[:-1]) * 60 * 2)
@@ -314,7 +324,7 @@ class DuckportClient:
             stmts += [
                 f"CREATE TABLE IF NOT EXISTS {s}.{target} ({kline_cols})",
                 f"CREATE TABLE IF NOT EXISTS _staging_{target} ({kline_cols})",
-                # Tells `duckport migrate nopk` this table's writer no longer needs a key.
+                # Tells `duckport upgrade` this table's writer no longer needs a key.
                 f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
                 f"VALUES ('write_mode:{target}', 'anti_join')",
                 f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
@@ -340,6 +350,62 @@ class DuckportClient:
 
         self.execute_transaction(stmts)
         logger.info(f"Schema '{s}' initialised on duckport-rs")
+
+        kline_columns = dict(c.split(" ", 1) for c in self.KLINE_COL_DEFS)
+        specs = [
+            self._spec_sql(
+                f"{market}_{interval}", kind="append", columns=kline_columns,
+                dedup_key=["open_time", "symbol"], time_column="open_time",
+                period_seconds=self._interval_seconds(interval),
+                string_checks={"symbol": {"max_len": 40}},
+            )
+            for market in markets if market in data_sources
+        ]
+        specs.append(self._spec_sql(
+            "exginfo", kind="snapshot",
+            columns={**dict(c.split(" ", 1) for c in self.EXGINFO_COL_DEFS), "created_time": "TIMESTAMP"},
+            dedup_key=["market", "symbol"],
+            string_checks={"market": {"max_len": 32, "pattern": "[a-z0-9_]{1,32}"},
+                           "symbol": {"max_len": 64}, "status": {"max_len": 32}},
+            column_defaults={"created_time": "CURRENT_TIMESTAMP"},
+        ))
+        self.register_table_specs(specs)
+
+    def _spec_sql(self, table, kind, columns, dedup_key, time_column=None, period_seconds=None,
+                  string_checks=None, column_defaults=None, legacy_columns=()) -> str:
+        """Upsert of one data.table_specs row: how duckport doctor / upgrade check the table."""
+        try:
+            version = metadata.version("binance-ingestor")
+        except metadata.PackageNotFoundError:
+            version = ""
+
+        def text(value):
+            return "NULL" if value is None else self._sql_str(str(value))
+
+        def doc(value):  # ASCII JSON
+            return self._sql_str(json.dumps(value or {}, ensure_ascii=True, sort_keys=True))
+
+        def strings(values):
+            return "[" + ", ".join(self._sql_str(v) for v in values) + "]::VARCHAR[]"
+
+        return (
+            f"INSERT OR REPLACE INTO {self.schema}.table_specs (table_name, writer, writer_version, kind, "
+            f"time_column, period_seconds, dedup_key, write_mode, columns, column_defaults, string_checks, "
+            f"legacy_columns, updated_at) VALUES ({text(table)}, {text(self.WRITER)}, {text(version)}, "
+            f"{text(kind)}, {text(time_column)}, {period_seconds if period_seconds else 'NULL'}, "
+            f"{strings(dedup_key)}, 'anti_join', {doc(columns)}, {doc(column_defaults)}, "
+            f"{doc(string_checks)}, {strings(legacy_columns)}, CURRENT_TIMESTAMP)"
+        )
+
+    def register_table_specs(self, statements: List[str]) -> bool:
+        """Register table specs; duckport-server < 1.2.0 has no data.table_specs and is skipped."""
+        try:
+            self.execute_transaction(statements)
+        except Exception as e:
+            logger.info(f"table specs not registered (duckport-server < 1.2.0?): {str(e).splitlines()[0][:200]}")
+            return False
+        logger.info(f"table specs registered: {len(statements)} table(s)")
+        return True
 
     def verify_kline_interval(self, interval: str):
         s = self.schema
