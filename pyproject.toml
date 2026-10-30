@@ -1,6 +1,6 @@
 [project]
 name = "binance-ingestor"
-version = "0.3.0"
+version = "0.4.0"
 description = "Standalone Binance data ingestor for duckport-rs"
 requires-python = ">=3.12"
 dependencies = [

@@ -25,7 +25,12 @@ def get_local_path(root_path, trading_type, market_data_type, time_period, symbo
     return path
 
 
-def clean_old_daily_zip(local_daily_path, symbols, interval):
+def clean_old_daily_zip(local_daily_path, symbols, interval, keep=frozenset()):
+    """Delete daily zips older than last month, except the basenames in ``keep``.
+
+    ``keep`` holds the gap-fill zips (see ``gap_filler.GapRecord.protected_files``): they cover
+    days the monthly archive lacks, so they must survive for every later Parquet rebuild.
+    """
     today = date.today()
     this_month_first_day = date(today.year, today.month, 1)
     daily_end = this_month_first_day - relativedelta(months=1)
@@ -38,6 +43,8 @@ def clean_old_daily_zip(local_daily_path, symbols, interval):
                 "{}-{}-{}.zip".format(symbol.upper(), interval, daily_end),
             )
             for item in os.listdir(local_daily_symbol_path):
+                if item in keep:
+                    continue
                 item_path = os.path.join(local_daily_symbol_path, item)
                 if item_path < zip_file_path:
                     os.remove(item_path)
@@ -84,15 +91,21 @@ def read_symbol_csv(symbol, zip_path, interval='5m', ydashm=None):
     return df
 
 
-def to_pqt(yms: list[str], interval: str = '5m', market: str = 'usdt_perp'):
+def to_pqt(yms: list[str], interval: str = '5m', market: str = 'usdt_perp', force: bool = False):
+    """Convert the zips of ``yms`` into one Parquet file.
+
+    An existing file is left alone unless it is the latest one (still growing) or ``force`` is
+    set — the gap filler forces the months that received new daily zips.
+    """
     if not yms:
         return
     filename = f'{market}_{yms[0]}_{len(yms)}M.parquet'
     latest_pqt = get_latest_parquet(market, interval)
-    if os.path.exists(os.path.join(PARQUET_DIR, f'{market}_{interval}', filename)) and filename != latest_pqt:
+    target = os.path.join(PARQUET_DIR, f'{market}_{interval}', filename)
+    if os.path.exists(target) and filename != latest_pqt and not force:
         logger.info(f'跳过 {filename}')
         return
-    logger.info(f'开始转换 {market}_{interval} {yms[0]}数据...')
+    logger.info(f'开始{"重建" if force else "转换"} {market}_{interval} {yms[0]}数据...')
     data_path = os.path.join(RESOURCE_PATH, f'{market}_{interval}')
     monthly_data_path = os.path.join(data_path, 'monthly_klines')
     os.makedirs(monthly_data_path, exist_ok=True)
@@ -123,7 +136,14 @@ def to_pqt(yms: list[str], interval: str = '5m', market: str = 'usdt_perp'):
                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'avg_price']]
 
     ensure_parquet_directories(market, interval)
-    dfs.to_parquet(f'{PARQUET_DIR}/{market}_{interval}/{filename}', index=False)
+    tmp = target + '.tmp'
+    try:
+        dfs.to_parquet(tmp, index=False)
+        os.replace(tmp, target)
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     logger.info(f'{market}_{interval} {yms[0]}数据转换完成')
 
 
@@ -146,7 +166,8 @@ def ensure_parquet_directories(market: str, interval: str = '5m'):
     return parquet_dir
 
 
-def batch_convert_to_parquet(market: str, interval: str = '5m'):
+def batch_convert_to_parquet(market: str, interval: str = '5m', force_months=()):
+    """Convert every partition; partitions containing a month in ``force_months`` are rebuilt."""
     logger.info(f'开始批量转换 {market}_{interval} 数据为parquet格式...')
     ensure_parquet_directories(market, interval)
 
@@ -157,10 +178,11 @@ def batch_convert_to_parquet(market: str, interval: str = '5m'):
 
     success_count = 0
     error_count = 0
+    force_months = set(force_months)
 
     for k, v in available_yms.items():
         try:
-            to_pqt(v, interval=interval, market=market)
+            to_pqt(v, interval=interval, market=market, force=bool(force_months & set(v)))
             success_count += 1
         except Exception as e:
             error_count += 1
@@ -170,6 +192,6 @@ def batch_convert_to_parquet(market: str, interval: str = '5m'):
     return success_count, error_count
 
 
-def batch_process_data(market: str, interval: str = '5m'):
+def batch_process_data(market: str, interval: str = '5m', force_months=()):
     logger.info(f'开始初始化 {market}_{interval} 数据...')
-    return batch_convert_to_parquet(market, interval)
+    return batch_convert_to_parquet(market, interval, force_months=force_months)

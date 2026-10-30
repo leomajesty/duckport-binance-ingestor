@@ -82,7 +82,11 @@ async def download(local_path, download_checksum_url, local_sum_path, local_zip_
             retry = 0
             while True:
                 if retry > retry_times and 'daily_klines' in local_path:
-                    logger.warning('下载daily zip失败次数超过retry_times，当前网络状况不稳定或数据包异常', local_zip_path)
+                    logger.warning(
+                        f'下载 daily zip 失败次数超过 retry_times，已放弃: {local_zip_path}'
+                        '（网络不稳定或数据包异常）'
+                    )
+                    error_info_list.add(f'放弃下载 {local_zip_path}（重试 {retry_times} 次）')
                     break
                 try:
                     sum_file = await session.get(download_checksum_url, proxy=file_proxy, timeout=20)
@@ -109,66 +113,3 @@ async def download(local_path, download_checksum_url, local_sum_path, local_zip_
                 except Exception as e:
                     error_info_list.add(f'下载{local_zip_path}失败，错误类型{type(e)}，已重试下载，请确认')
                 retry += 1
-
-
-async def download_miss_day_data(symbol, interval, day, local_path, sum_name, prefix, download_err_info, sem):
-    local_sum_path = os.path.join(local_path, sum_name)
-    sum_url = BASE_URL + prefix + sum_name
-    local_zip_path = local_sum_path[0:-9]
-    err_times = 0
-    retry_sum_404 = 0
-    retry_zip_404 = 0
-
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False)) as session:
-        async with sem:
-            while True:
-                try:
-                    sum_file = await session.get(sum_url, proxy=file_proxy, timeout=20)
-                    if sum_file.status == 200:
-                        sum_file_buffer = await sum_file.read()
-                        async with aiofiles.open(local_sum_path, 'wb') as out_sum_file:
-                            await out_sum_file.write(sum_file_buffer)
-                    else:
-                        retry_sum_404 += 1
-                        if retry_sum_404 > 3:
-                            break
-                        else:
-                            continue
-
-                    zip_file = await session.get(sum_url[0:-9], proxy=file_proxy, timeout=20)
-                    if zip_file.status == 200:
-                        zip_file_buffer = await zip_file.read()
-                        async with aiofiles.open(local_zip_path, 'wb') as out_zip_file:
-                            await out_zip_file.write(zip_file_buffer)
-                    else:
-                        retry_zip_404 += 1
-                        if retry_zip_404 > 3:
-                            break
-                        else:
-                            continue
-
-                    async with aiofiles.open(local_sum_path, encoding='utf-8') as in_sum_file:
-                        str_sum = await in_sum_file.readline()
-                        correct_sum = str_sum.split(' ')[0]
-                    sha256_obj = sha256()
-                    async with aiofiles.open(local_zip_path, 'rb') as in_zip_file:
-                        sha256_obj.update(await in_zip_file.read())
-                    if correct_sum == sha256_obj.hexdigest().lower():
-                        break
-                except aiohttp.ClientError as ae:
-                    download_err_info.add(f'下载{local_zip_path}失败，错误原因{ae}，已重试下载，请确认')
-                    err_times += 1
-                    if err_times > 5:
-                        logger.error('补漏下载重试超过5次')
-                        raise ae
-                except Exception as e:
-                    logger.info(f'下载{local_zip_path}失败，错误类型{type(e)}，已重试下载，请确认')
-                    download_err_info.add(f'下载{local_zip_path}失败，错误类型{type(e)}，已重试下载，请确认')
-                    err_times += 1
-                    if err_times > 5:
-                        logger.error('补漏下载重试超过5次')
-                        raise e
-
-    if retry_sum_404 > 3 or retry_zip_404 > 3:
-        logger.info(f'{sum_name} not exist, request from api')
-        logger.warning(f'Missing data for {symbol} on {day}, API fallback not implemented')
