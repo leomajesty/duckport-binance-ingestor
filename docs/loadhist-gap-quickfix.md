@@ -2,7 +2,7 @@
 
 适用场景：duckport 库里的 K 线表存在"整天缺失"的空洞（币安月归档缺天导致），而完整跑一次 `duckport loadhist <实例>` 代价太高。本文的做法只执行 binance-ingestor 0.4.0 新增的补漏步骤和补漏导入，跳过全量下载与转换，实时采集全程不停。
 
-pro.studio 已于 2026-11-02 按此流程执行，耗时 3.2 分钟。背景与审计结果见 http://192.168.9.20:8088/binance-ingestor-loadhist-gap-audit-2026-10-30.html ，代码改动见 https://github.com/sjmc-quant/duckport-binance-ingestor/pull/2 。
+pro.studio 已于 2026-11-02 按此流程执行，耗时 3.2 分钟。背景与审计结果见 http://192.168.9.20:8088/duckport/binance-ingestor-loadhist-gap-audit-2026-10-30.html ，代码改动见 https://github.com/sjmc-quant/duckport-binance-ingestor/pull/2 。
 
 ## 1. 原理
 
