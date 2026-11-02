@@ -4,11 +4,14 @@ Historical kline bulk loader — v2
 Flow:
   Step 0  ping + init_schema
   Step 1  Download monthly/daily zips → convert to Parquet
+  Step 1b Gap fill: days missing from the monthly archives are fetched as daily zips,
+          the affected months are rebuilt (hist/gap_filler.py)
   Step 2  Incremental clean (skip unchanged files via .ok marker, atomic write)
-  Step 3  Incremental load (boundary = duck_time - BOUNDARY_DAYS, anti-join dedup)
+  Step 3  Incremental load (boundary = duck_time - BOUNDARY_DAYS, anti-join dedup);
+          gap-filled (symbol, day) pairs are loaded even when they lie before the boundary
 
 Assumptions:
-  - Data before duck_time is complete and accurate; no backfill needed.
+  - Data before duck_time is complete and accurate except for the recorded gaps; no other backfill.
   - A 1-day overlap (boundary = duck_time - 1 day) is kept for redundancy.
   - Parquet files are retained after load; a reminder is printed at exit.
 
@@ -19,8 +22,10 @@ Usage:
 import asyncio
 import os
 import random
+import re
 from datetime import datetime, timedelta
 from glob import glob
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 import duckdb
@@ -42,6 +47,7 @@ from binance_ingestor.hist import (
     async_download_file,
     get_local_path, clean_old_daily_zip,
     batch_process_data,
+    GapRecord, fill_gaps,
 )
 from binance_ingestor.utils.log_kit import logger
 from binance_ingestor.utils.timer import timer
@@ -55,9 +61,19 @@ LOADHIST_BATCH_ROWS = int(os.getenv("LOADHIST_BATCH_ROWS", "50000"))
 LOADHIST_DUCKDB_MEMORY_LIMIT = os.getenv("LOADHIST_DUCKDB_MEMORY_LIMIT", "")
 LOADHIST_DUCKDB_THREADS = int(os.getenv("LOADHIST_DUCKDB_THREADS", "1"))
 
+_PARQUET_MONTH_RE = re.compile(r"_(\d{4}-\d{2})_\d+M\.parquet$")
+
 
 def get_enabled_kline_markets():
     return [m for m in KLINE_MARKETS if m in DATA_SOURCES]
+
+
+def _local_duckdb():
+    con = duckdb.connect()
+    con.execute(f"SET threads TO {LOADHIST_DUCKDB_THREADS}")
+    if LOADHIST_DUCKDB_MEMORY_LIMIT:
+        con.execute(f"SET memory_limit = '{LOADHIST_DUCKDB_MEMORY_LIMIT}'")
+    return con
 
 
 # ── Step 0 ────────────────────────────────────────────────────────────
@@ -90,7 +106,8 @@ async def _ping_binance():
             logger.warning(f'币安接口无法连接: {e}')
 
 
-def _download_market(trade_type: str, interval: str) -> datetime:
+def _download_market(trade_type: str, interval: str) -> GapRecord:
+    """Download + convert one market, then fill the days its monthly archives lack."""
     logger.info(f'开始下载 {trade_type} 数据...')
     params = {
         'delimiter': '/',
@@ -111,9 +128,10 @@ def _download_market(trade_type: str, interval: str) -> datetime:
     all_list = monthly_list + daily_list
     random.shuffle(all_list)
 
+    # Gap-fill zips cover days the monthly archive lacks; they must survive the cleanup.
     clean_old_daily_zip(
         get_local_path(RESOURCE_PATH, trade_type, 'klines', 'daily', None, interval),
-        symbols, interval,
+        symbols, interval, keep=GapRecord(trade_type, interval).protected_files(),
     )
 
     error_set: set = set()
@@ -121,15 +139,28 @@ def _download_market(trade_type: str, interval: str) -> datetime:
     if error_set:
         logger.warning(f'{trade_type} 下载有 {len(error_set)} 个错误（已重试）')
 
-    end_time = datetime.now()
     _convert_to_parquet(trade_type, interval)
-    return end_time
+    return _fill_gaps(trade_type, interval)
 
 
-def _convert_to_parquet(trade_type: str, interval: str):
+def _fill_gaps(trade_type: str, interval: str) -> GapRecord:
+    """Step 1b: fetch daily zips for missing days and rebuild the months that received any."""
+    logger.info(f'--- Step 1b: 补漏 {trade_type} ---')
+    con = _local_duckdb()
+    try:
+        record, months = fill_gaps(trade_type, interval, con)
+    finally:
+        con.close()
+    if months:
+        logger.info(f'{trade_type}: 重建 {len(months)} 个月份的 Parquet: {sorted(months)}')
+        _convert_to_parquet(trade_type, interval, force_months=months)
+    return record
+
+
+def _convert_to_parquet(trade_type: str, interval: str, force_months=()):
     logger.info(f'转换 {trade_type} zip → Parquet ...')
     try:
-        success, errors = batch_process_data(trade_type, interval)
+        success, errors = batch_process_data(trade_type, interval, force_months=force_months)
         if errors:
             logger.warning(f'{trade_type} 转换完成，{errors} 个文件失败')
         else:
@@ -138,15 +169,18 @@ def _convert_to_parquet(trade_type: str, interval: str):
         logger.error(f'{trade_type} 转换异常: {e}')
 
 
-def run_download(interval: str):
+def run_download(interval: str) -> Dict[str, GapRecord]:
+    """Download every enabled market; returns ``{market: GapRecord}`` for Step 3."""
     start = datetime.now()
+    records: Dict[str, GapRecord] = {}
     if 'usdt_perp' in DATA_SOURCES:
         logger.info('=== 下载期货数据 ===')
-        _download_market('usdt_perp', interval)
+        records['usdt_perp'] = _download_market('usdt_perp', interval)
     if 'usdt_spot' in DATA_SOURCES:
         logger.info('=== 下载现货数据 ===')
-        _download_market('usdt_spot', interval)
+        records['usdt_spot'] = _download_market('usdt_spot', interval)
     logger.info(f'下载完成，耗时 {(datetime.now() - start).seconds / 60:.1f} 分钟')
+    return records
 
 
 # ── Step 2: incremental clean ─────────────────────────────────────────
@@ -247,7 +281,24 @@ def clean_markets(markets: list) -> None:
 
 # ── Step 3: incremental load ──────────────────────────────────────────
 
-def save_to_duckport(client: DuckportClient, markets: list) -> None:
+def _gap_predicate(pairs: List[Tuple[str, str]]) -> str:
+    """SQL selecting exactly the given (symbol, 'YYYY-MM-DD') pairs."""
+    by_symbol: Dict[str, List[str]] = {}
+    for symbol, day in pairs:
+        by_symbol.setdefault(symbol, []).append(day)
+    parts = []
+    for symbol, days in sorted(by_symbol.items()):
+        sym = symbol.replace("'", "''")
+        day_list = ", ".join(f"DATE '{d}'" for d in sorted(set(days)))
+        parts.append(f"(symbol = '{sym}' AND CAST(open_time AS DATE) IN ({day_list}))")
+    return "(" + " OR ".join(parts) + ")"
+
+
+def save_to_duckport(
+    client: DuckportClient,
+    markets: list,
+    gap_records: Optional[Dict[str, GapRecord]] = None,
+) -> None:
     """
     Incremental load with a 1-day redundancy buffer:
 
@@ -257,11 +308,19 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
       file_max >= boundary  →  WHERE open_time >= boundary
                                 the anti-join dedup handles the overlap
       boundary is None      →  full load (first run)
+
+    Gap-filled days (``gap_records[market]``, status ``downloaded``) lie before the boundary.
+    Their files are read anyway with a predicate selecting just those (symbol, day) pairs;
+    once written they are marked ``loaded``. duck_time only ever moves forward.
     """
+    gap_records = gap_records or {}
     for market in markets:
         existing_dt = client.read_duck_time(market)
         ed       = existing_dt.replace(tzinfo=None) if existing_dt else None
         boundary = ed - timedelta(days=BOUNDARY_DAYS) if ed else None
+
+        record  = gap_records.get(market)
+        pending = record.pending_by_month() if record else {}
 
         pqt_dir = os.path.join(PARQUET_DIR, f"{market}_{KLINE_INTERVAL}")
         files   = sorted(glob(os.path.join(pqt_dir, f"{market}_*.parquet")))
@@ -271,18 +330,19 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
 
         logger.info(
             f"{market}: duck_time={ed}  boundary={boundary}  files={len(files)}"
+            + (f"  补漏月份={sorted(pending)}" if pending else "")
         )
 
-        local_conn = duckdb.connect()
-        local_conn.execute(f"SET threads TO {LOADHIST_DUCKDB_THREADS}")
-        if LOADHIST_DUCKDB_MEMORY_LIMIT:
-            local_conn.execute(f"SET memory_limit = '{LOADHIST_DUCKDB_MEMORY_LIMIT}'")
+        local_conn = _local_duckdb()
         new_max    = None
         total_rows = 0
+        gap_rows   = 0
 
         try:
             for fp in files:
                 fp_esc = _sql_path(fp)
+                m = _PARQUET_MONTH_RE.search(os.path.basename(fp))
+                gap_pairs = pending.get(m.group(1), []) if m else []
 
                 row = local_conn.execute(
                     f"SELECT max(open_time) FROM read_parquet('{fp_esc}')"
@@ -292,17 +352,19 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
 
                 fm = row[0].replace(tzinfo=None)
 
-                if boundary is not None and fm < boundary:
+                if boundary is not None and fm < boundary and not gap_pairs:
                     logger.debug(
                         f"skip {os.path.basename(fp)} "
                         f"(file_max={fm:%Y-%m-%d} < boundary={boundary:%Y-%m-%d})"
                     )
                     continue
 
-                where = (
-                    f"WHERE open_time >= '{boundary:%Y-%m-%d %H:%M:%S}'"
-                    if boundary else ""
-                )
+                preds = []
+                if boundary is not None:
+                    preds.append(f"open_time >= '{boundary:%Y-%m-%d %H:%M:%S}'")
+                    if gap_pairs:
+                        preds.append(_gap_predicate(gap_pairs))
+                where = f"WHERE {' OR '.join(preds)}" if preds else ""
 
                 reader = local_conn.execute(f"""
                     SELECT open_time, symbol, open, high, low, close, volume,
@@ -329,6 +391,23 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
                     file_rows += len(arrow)
                     total_rows += len(arrow)
 
+                if gap_pairs:
+                    if file_rows == 0:
+                        logger.warning(
+                            f"{market}  {os.path.basename(fp)}: 补漏 {len(gap_pairs)} 天"
+                            f"在 Parquet 中仍无数据，保留待处理"
+                        )
+                    else:
+                        for symbol, day in gap_pairs:
+                            record.set(symbol, day, "loaded")
+                        gap_rows += file_rows
+                        logger.info(
+                            f"{market}  {os.path.basename(fp)}: 补漏 {len(gap_pairs)} 天 "
+                            f"(+{file_rows:,} rows incl. overlap)"
+                        )
+                        if boundary is not None and fm < boundary:
+                            continue
+
                 if file_rows == 0:
                     continue
 
@@ -342,12 +421,18 @@ def save_to_duckport(client: DuckportClient, markets: list) -> None:
 
         finally:
             local_conn.close()
+            if record is not None:
+                record.save()
 
-        if new_max is not None:
+        if new_max is not None and (ed is None or new_max > ed):
             client.replace_duck_time(market, new_max.strftime("%Y-%m-%d %H:%M:%S"))
             logger.info(
                 f"{market}: 导入完成，共 {total_rows:,} 行，"
                 f"duck_time → {new_max:%Y-%m-%d %H:%M:%S}"
+            )
+        elif total_rows:
+            logger.info(
+                f"{market}: 导入 {total_rows:,} 行（补漏 {gap_rows:,} 行），duck_time 保持 {ed}"
             )
         else:
             logger.info(f"{market}: 无新数据，duck_time 保持 {ed}")
@@ -367,9 +452,9 @@ def main():
     logger.info("初始化远程 schema ...")
     init_remote_schema(client)
 
-    # Step 1: download
+    # Step 1 (+1b gap fill): download
     logger.info("--- Step 1: 下载 ---")
-    run_download(KLINE_INTERVAL)
+    gap_records = run_download(KLINE_INTERVAL)
 
     markets = get_enabled_kline_markets()
     if not markets:
@@ -383,7 +468,7 @@ def main():
 
     # Step 3: load
     logger.info("--- Step 3: 导入 ---")
-    save_to_duckport(client, markets)
+    save_to_duckport(client, markets, gap_records=gap_records)
 
     client.close()
 

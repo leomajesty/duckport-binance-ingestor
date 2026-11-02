@@ -14,6 +14,7 @@ from .symbol_manager import *
 from .data_lister import *
 from .downloader import *
 from .file_manager import *
+from .gap_filler import GapRecord, fill_gaps, find_missing_days
 
 __version__ = "1.0.0"
 __all__ = [
@@ -32,7 +33,10 @@ __all__ = [
     "get_download_prefix",
 
     # Downloading
-    "async_download_file", "download", "download_miss_day_data",
+    "async_download_file", "download",
+
+    # Gap filling (days missing from Binance's monthly archives)
+    "GapRecord", "fill_gaps", "find_missing_days",
 
     # File management
     "get_local_path", "clean_old_daily_zip",
